@@ -84,10 +84,11 @@ packages/
       store/
         memory.ts    — MemoryStore: in-memory message persistence
       __tests__/
-        store.test.ts      — 11 tests: store CRUD + filtering
-        client.test.ts     — 6 tests: peer resolution + send functions
-        runtime.test.ts    — 9 tests: receive/onMessage/listMessages/send
-        extension.test.ts  — 10 tests: extension wiring + manifest tagging
+        store.test.ts        — store CRUD + filtering
+        client.test.ts       — peer resolution + send functions
+        runtime.test.ts      — receive/onMessage/listMessages/send
+        extension.test.ts    — extension wiring + manifest tagging
+        integration.test.ts  — two-agent E2E (mocked HTTP)
     types/
       index.ts       — All XMPT type definitions (XMPTMessage, XMPTPeer, XMPTRuntime, ...)
   example/
@@ -101,21 +102,21 @@ packages/
 ## Test Results
 
 ```
-bun test src/__tests__/
+bun test
 
- 36 pass
+ 96 pass
  0 fail
- 70 expect() calls
-Ran 36 tests across 4 files. [19.00ms]
+ 165 expect() calls
+Ran 96 tests across 10 files. [294.00ms]
 ```
 
-All 36 tests pass. Tests were written TDD-first (failing tests before implementation for each milestone):
+All 96 tests pass. Tests follow TDD — failing tests written first, then implementation to make them green:
 
-- **Milestone 1** — Extension skeleton + type wiring
-- **Milestone 2** — Send/receive core (mocked fetch)
-- **Milestone 3** — Threading + store (MemoryStore filters)
-- **Milestone 4** — Manifest discoverability (skill tags + capability extension)
-- **Milestone 5** — Local E2E (two agents, real HTTP, thread continuity)
+- **Milestone 1** — Types + Extension skeleton (`extension.test.ts`, `types.test.ts`)
+- **Milestone 2** — Send/receive core (`client.test.ts`, `runtime.test.ts`)
+- **Milestone 3** — Threading + store (`store.test.ts`)
+- **Milestone 4** — Manifest discoverability (`extension.test.ts` manifest tests)
+- **Milestone 5** — Local E2E integration (`integration.test.ts` — mocked HTTP two-agent scenario)
 
 ## Local E2E Output
 
@@ -136,7 +137,7 @@ beta.listMessages({ threadId: "demo-thread-1" }) → 1 message(s)
 beta.listMessages({ threadId: "demo-thread-1" }) after 2nd msg → 2 message(s)
 ✅ Thread continuity preserved across messages
 
-🎉 XMPT local messaging demo complete!
+🎉 XMTP local messaging demo complete!
 ```
 
 ## Technical Notes & Design Decisions
@@ -154,3 +155,5 @@ beta.listMessages({ threadId: "demo-thread-1" }) after 2nd msg → 2 message(s)
 6. **Peer resolution** — Supports both `{ url }` and `{ card: { url } }` peer formats, consistent with the `XMTPeer` type in the PRD.
 
 7. **Inbox registration is safe** — If the user manually registered the inbox entrypoint key before calling `.use(xmpt(...))`, the duplicate is silently ignored.
+
+8. **Manifest discoverability** — `onManifestBuild()` adds the xmpt skill to the agent card even if it wasn't pre-registered, ensuring remote agents can always discover XMPT capability.

@@ -14,10 +14,10 @@
  *   - We print both agents' message stores
  */
 
-import { createXMPTRuntime } from '../../xmpt/src/runtime.js';
-import { MemoryStore } from '../../xmpt/src/store/memory.js';
-import type { XMPTMessage } from '../../xmpt/src/types-internal.js';
-import type { XMPTRuntimeInternals } from '../../xmpt/src/runtime.js';
+import { createXMPTRuntime } from '../../../xmpt/src/runtime.js';
+import { MemoryStore } from '../../../xmpt/src/store/memory.js';
+import type { XMPTMessage } from '../../../xmpt/src/types-internal.js';
+import type { XMPTRuntimeInternals } from '../../../xmpt/src/runtime.js';
 
 // ─── Minimal HTTP server wrapping the xmpt inbox entrypoint ──────────────────
 
