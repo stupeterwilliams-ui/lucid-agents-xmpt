@@ -1,211 +1,149 @@
-/**
- * Unit tests: XMPTRuntime
- * TDD Milestones 2 & 3: Send/Receive + Threading
- */
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, mock, spyOn } from 'bun:test';
 import { createXMPTRuntime } from '../runtime.js';
-import { createMemoryStore } from '../store/memory.js';
-import type { XMPTMessage, XMPTInboxHandler } from '../../types/index.js';
+import { MemoryStore } from '../store/memory.js';
+import type { XMPTMessage } from '../types-internal.js';
 
-function makeRuntime(opts: {
-  inboxHandler?: XMPTInboxHandler;
-  transport?: 'agentm' | 'http';
-}) {
-  return createXMPTRuntime({
-    transport: opts.transport ?? 'http',
-    inboxKey: 'xmpt-inbox',
-    inboxHandler: opts.inboxHandler,
-    store: createMemoryStore(),
-    agentUrl: 'http://agent-a:8787',
-  });
+function makeInboundMsg(overrides: Partial<XMPTMessage> = {}): XMPTMessage {
+  return {
+    id: `inbound-${Date.now()}`,
+    content: { text: 'ping' },
+    createdAt: new Date().toISOString(),
+    from: 'http://sender:3001',
+    ...overrides,
+  };
 }
 
-describe('XMPTRuntime.receive', () => {
-  it('calls inbox handler with the message', async () => {
-    const received: XMPTMessage[] = [];
-    const runtime = makeRuntime({
-      inboxHandler: async ({ message }) => {
-        received.push(message);
-        return null;
-      },
-    });
-
-    const msg: XMPTMessage = {
-      id: 'msg-1',
-      threadId: 't-1',
-      content: { text: 'ping' },
-      createdAt: new Date().toISOString(),
-    };
-
-    await runtime.receive(msg);
-    expect(received).toHaveLength(1);
-    expect(received[0].content.text).toBe('ping');
-  });
-
-  it('returns the handler reply', async () => {
-    const runtime = makeRuntime({
-      inboxHandler: async ({ message }) => ({
-        content: { text: `ack:${message.content.text ?? ''}` },
-      }),
-    });
-
-    const reply = await runtime.receive({
-      id: 'msg-2',
-      threadId: 't-2',
-      content: { text: 'hello' },
-      createdAt: new Date().toISOString(),
-    });
-
-    expect(reply).toBeDefined();
-    expect((reply as any)?.content?.text).toBe('ack:hello');
-  });
-
-  it('persists message to store', async () => {
-    const store = createMemoryStore();
-    const runtime = createXMPTRuntime({
-      transport: 'http',
-      inboxKey: 'xmpt-inbox',
-      store,
-      agentUrl: 'http://agent-a:8787',
-    });
-
-    await runtime.receive({
-      id: 'stored-msg',
-      threadId: 't-store',
-      content: { text: 'store me' },
-      createdAt: new Date().toISOString(),
-    });
-
-    expect(store.get('stored-msg')).toBeDefined();
-  });
-
-  it('notifies onMessage subscribers', async () => {
-    const runtime = makeRuntime({});
-    const events: XMPTMessage[] = [];
-    runtime.onMessage(msg => { events.push(msg); });
-
-    await runtime.receive({
-      id: 'notif-1',
-      threadId: 't-notif',
-      content: { text: 'notify me' },
-      createdAt: new Date().toISOString(),
-    });
-
-    expect(events).toHaveLength(1);
-  });
-
-  it('works with no inbox handler (no error)', async () => {
-    const runtime = makeRuntime({});
-    const reply = await runtime.receive({
-      id: 'no-handler',
-      threadId: 't-none',
-      content: { text: 'no handler' },
-      createdAt: new Date().toISOString(),
-    });
-    expect(reply).toBeNull();
+describe('createXMPTRuntime', () => {
+  it('exposes the expected API surface', () => {
+    const rt = createXMPTRuntime({});
+    expect(typeof rt.send).toBe('function');
+    expect(typeof rt.sendAndWait).toBe('function');
+    expect(typeof rt.receive).toBe('function');
+    expect(typeof rt.onMessage).toBe('function');
+    expect(typeof rt.listMessages).toBe('function');
+    expect(typeof rt._handleInbound).toBe('function');
   });
 });
 
-describe('XMPTRuntime.onMessage', () => {
-  it('returns unsubscribe function', async () => {
-    const runtime = makeRuntime({});
-    const events: XMPTMessage[] = [];
-    const unsub = runtime.onMessage(msg => { events.push(msg); });
+describe('receive()', () => {
+  it('saves the message to the store', async () => {
+    const store = new MemoryStore();
+    const rt = createXMPTRuntime({ store });
+    const msg = makeInboundMsg({ id: 'r1' });
+    await rt.receive(msg);
+    expect(store.size()).toBe(1);
+    expect(await store.get('r1')).toEqual(msg);
+  });
 
-    await runtime.receive({
-      id: 'ev-1',
-      threadId: 't-ev',
-      content: { text: 'first' },
-      createdAt: new Date().toISOString(),
+  it('notifies subscribers', async () => {
+    const received: XMPTMessage[] = [];
+    const rt = createXMPTRuntime({});
+    rt.onMessage(m => { received.push(m); });
+    const msg = makeInboundMsg();
+    await rt.receive(msg);
+    expect(received).toHaveLength(1);
+    expect(received[0].id).toBe(msg.id);
+  });
+
+  it('calls inbox handler and returns reply', async () => {
+    const rt = createXMPTRuntime({
+      inbox: {
+        handler: async ({ message }) => ({
+          content: { text: `ack:${message.content.text}` },
+        }),
+      },
     });
+    const msg = makeInboundMsg({ id: 'h1', content: { text: 'world' } });
+    const reply = await rt.receive(msg) as XMPTMessage;
+    expect(reply).toBeTruthy();
+    expect(reply.content.text).toBe('ack:world');
+  });
 
-    unsub(); // remove subscriber
+  it('returns void when inbox has no handler', async () => {
+    const rt = createXMPTRuntime({});
+    const result = await rt.receive(makeInboundMsg());
+    expect(result).toBeUndefined();
+  });
+});
 
-    await runtime.receive({
-      id: 'ev-2',
-      threadId: 't-ev',
-      content: { text: 'second' },
-      createdAt: new Date().toISOString(),
-    });
-
-    expect(events).toHaveLength(1); // only the first one
+describe('onMessage()', () => {
+  it('returns an unsubscribe function', async () => {
+    const received: XMPTMessage[] = [];
+    const rt = createXMPTRuntime({});
+    const unsub = rt.onMessage(m => { received.push(m); });
+    await rt.receive(makeInboundMsg());
+    unsub();
+    await rt.receive(makeInboundMsg());
+    expect(received).toHaveLength(1);
   });
 
   it('supports multiple subscribers', async () => {
-    const runtime = makeRuntime({});
-    const a: string[] = [];
-    const b: string[] = [];
-    runtime.onMessage(m => { a.push(m.id); });
-    runtime.onMessage(m => { b.push(m.id); });
-
-    await runtime.receive({
-      id: 'multi-1',
-      threadId: 't-multi',
-      content: { text: 'both' },
-      createdAt: new Date().toISOString(),
-    });
-
-    expect(a).toEqual(['multi-1']);
-    expect(b).toEqual(['multi-1']);
+    let count = 0;
+    const rt = createXMPTRuntime({});
+    rt.onMessage(() => { count++; });
+    rt.onMessage(() => { count++; });
+    await rt.receive(makeInboundMsg());
+    expect(count).toBe(2);
   });
-});
 
-describe('XMPTRuntime.listMessages', () => {
-  it('returns messages filtered by threadId', async () => {
-    const runtime = makeRuntime({});
-    const msgs = [
-      { id: 'a', threadId: 'thread-A', content: { text: 'a' }, createdAt: new Date().toISOString() },
-      { id: 'b', threadId: 'thread-B', content: { text: 'b' }, createdAt: new Date().toISOString() },
-      { id: 'c', threadId: 'thread-A', content: { text: 'c' }, createdAt: new Date().toISOString() },
-    ];
-    for (const m of msgs) await runtime.receive(m);
-
-    const result = runtime.listMessages({ threadId: 'thread-A' });
-    expect(result).toHaveLength(2);
-    result.forEach(m => expect(m.threadId).toBe('thread-A'));
-  });
-});
-
-describe('XMPTRuntime.send (mocked fetch)', () => {
-  it('builds outbound message with threadId and from', async () => {
-    const store = createMemoryStore();
-    const runtime = createXMPTRuntime({
-      transport: 'http',
-      inboxKey: 'xmpt-inbox',
-      store,
-      agentUrl: 'http://agent-a:8787',
-    });
-
-    // Patch global fetch temporarily
-    const originalFetch = globalThis.fetch;
-    let capturedUrl: string | undefined;
-    let capturedBody: any;
-    (globalThis as any).fetch = async (url: string, init?: any) => {
-      capturedUrl = url;
-      capturedBody = JSON.parse(init?.body ?? '{}');
-      return {
-        ok: true,
-        json: async () => ({ taskId: 'mock-task', status: 'delivered' }),
-      };
-    };
-
+  it('does not crash runtime if subscriber throws', async () => {
+    const rt = createXMPTRuntime({});
+    rt.onMessage(() => { throw new Error('subscriber boom'); });
+    // Should not propagate the subscriber error
+    let threw = false;
     try {
-      const result = await runtime.send(
-        { url: 'http://agent-b:8788' },
-        { content: { text: 'hello world' }, threadId: 'fixed-thread' }
-      );
-
-      expect(capturedUrl).toBe('http://agent-b:8788/xmpt/inbox');
-      expect(capturedBody.content.text).toBe('hello world');
-      expect(capturedBody.threadId).toBe('fixed-thread');
-      expect(capturedBody.from).toBe('http://agent-a:8787');
-      expect(result.messageId).toBeDefined();
-
-      // Message should be persisted
-      const stored = store.list({ threadId: 'fixed-thread' });
-      expect(stored).toHaveLength(1);
-    } finally {
-      (globalThis as any).fetch = originalFetch;
+      await rt.receive(makeInboundMsg());
+    } catch {
+      threw = true;
     }
+    expect(threw).toBe(false);
+  });
+});
+
+describe('listMessages()', () => {
+  it('lists all stored messages', async () => {
+    const rt = createXMPTRuntime({});
+    await rt.receive(makeInboundMsg({ id: 'l1', threadId: 'thread-A' }));
+    await rt.receive(makeInboundMsg({ id: 'l2', threadId: 'thread-B' }));
+    const all = await rt.listMessages();
+    expect(all.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('filters by threadId', async () => {
+    const rt = createXMPTRuntime({});
+    await rt.receive(makeInboundMsg({ id: 'f1', threadId: 'T1' }));
+    await rt.receive(makeInboundMsg({ id: 'f2', threadId: 'T2' }));
+    await rt.receive(makeInboundMsg({ id: 'f3', threadId: 'T1' }));
+    const filtered = await rt.listMessages({ threadId: 'T1' });
+    expect(filtered).toHaveLength(2);
+    expect(filtered.every(m => m.threadId === 'T1')).toBe(true);
+  });
+});
+
+describe('_handleInbound()', () => {
+  it('stores the message', async () => {
+    const store = new MemoryStore();
+    const rt = createXMPTRuntime({ store });
+    const msg = makeInboundMsg({ id: 'ib1' });
+    await rt._handleInbound(msg);
+    expect(await store.get('ib1')).toEqual(msg);
+  });
+
+  it('invokes inbox handler and returns reply', async () => {
+    const rt = createXMPTRuntime({
+      inbox: {
+        handler: async ({ message }) => ({
+          content: { text: `echo:${message.content.text}` },
+        }),
+      },
+    });
+    const reply = await rt._handleInbound(makeInboundMsg({ content: { text: 'test' } }));
+    expect(reply?.content.text).toBe('echo:test');
+  });
+
+  it('returns undefined when no handler configured', async () => {
+    const rt = createXMPTRuntime({});
+    const result = await rt._handleInbound(makeInboundMsg());
+    expect(result).toBeUndefined();
   });
 });

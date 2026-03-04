@@ -1,45 +1,27 @@
 /**
- * @lucid-agents/xmpt — Type definitions
- *
- * These types are designed to be contributed upstream into @lucid-agents/types.
- * They are provided here as a standalone package for immediate use.
+ * XMPT type definitions (internal copy — for upstream contribution to @lucid-agents/types).
  */
-
-import type { AgentCard } from '@lucid-agents/a2a';
 
 // ─── Content & Message ──────────────────────────────────────────────────────
 
-/** Content payload of an XMPT message. */
 export type XMPTContent = {
   text?: string;
   data?: unknown;
   mime?: string;
 };
 
-/** A peer that can receive XMPT messages. */
-export type XMPTPeer = { url: string } | { card: AgentCard };
+export type XMPTPeer = { url: string } | { card: Record<string, unknown> };
 
-/**
- * Envelope wrapping a message exchanged between agents.
- */
 export type XMPTMessage = {
-  /** Unique message identifier (UUID). */
   id: string;
-  /** Thread identifier for grouping related messages. */
   threadId?: string;
-  /** Sender peer URL or agent card URL. */
   from?: string;
-  /** Recipient peer URL. */
   to?: string;
-  /** Message content. */
   content: XMPTContent;
-  /** Arbitrary metadata. */
   metadata?: Record<string, unknown>;
-  /** ISO-8601 creation timestamp. */
   createdAt: string;
 };
 
-/** Result returned after delivering a message. */
 export type XMPTDeliveryResult = {
   taskId: string;
   status: string;
@@ -48,7 +30,6 @@ export type XMPTDeliveryResult = {
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
-/** Filters for listing messages from the store. */
 export type XMPTListFilters = {
   threadId?: string;
   from?: string;
@@ -57,7 +38,6 @@ export type XMPTListFilters = {
   offset?: number;
 };
 
-/** Pluggable message store interface. */
 export type XMPTStore = {
   save(message: XMPTMessage): Promise<void>;
   list(filters?: XMPTListFilters): Promise<XMPTMessage[]>;
@@ -66,108 +46,58 @@ export type XMPTStore = {
 
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 
-/** Options for runtime.xmpt.send() */
 export type XMPTSendOptions = {
   threadId?: string;
   metadata?: Record<string, unknown>;
-  /** Skill ID on the remote inbox (default: 'xmpt-inbox'). */
   skillId?: string;
 };
 
-/** Options for runtime.xmpt.sendAndWait() */
 export type XMPTSendAndWaitOptions = XMPTSendOptions & {
-  /** Maximum time to wait for reply in ms (default: 15_000). */
   timeoutMs?: number;
 };
 
-/**
- * The XMPT runtime slice exposed on AgentRuntime as `runtime.xmpt`.
- */
 export type XMPTRuntime = {
-  /**
-   * Send a message to a peer agent (fire-and-forget).
-   * Returns delivery metadata including the remote taskId.
-   */
   send(
     peer: XMPTPeer,
     message: Pick<XMPTMessage, 'content'> & Partial<XMPTMessage>,
     options?: XMPTSendOptions
   ): Promise<XMPTDeliveryResult>;
 
-  /**
-   * Send a message and wait for the remote agent to complete processing.
-   * Returns the full reply message if the handler returned one.
-   */
   sendAndWait(
     peer: XMPTPeer,
     message: Pick<XMPTMessage, 'content'> & Partial<XMPTMessage>,
     options?: XMPTSendAndWaitOptions
   ): Promise<XMPTMessage | null>;
 
-  /**
-   * Dispatch a message directly to this agent's inbox (local delivery).
-   * Useful for testing and internal routing.
-   */
   receive(message: XMPTMessage): Promise<XMPTMessage | void>;
 
-  /**
-   * Register a handler for all incoming messages (subscription).
-   * Multiple handlers can be registered; they run in order.
-   */
   onMessage(
     handler: (message: XMPTMessage) => Promise<void> | void
   ): () => void;
 
-  /**
-   * List stored messages with optional filters.
-   */
   listMessages(filters?: XMPTListFilters): Promise<XMPTMessage[]>;
 };
 
 // ─── Extension options ────────────────────────────────────────────────────────
 
-/** Context passed to the inbox handler. */
 export type XMPTInboxContext = {
   message: XMPTMessage;
-  /** Skill key this inbox is registered under. */
   skillKey: string;
 };
 
-/** Return value from the inbox handler — if provided, sent back as a reply. */
 export type XMPTInboxReply = {
   content: XMPTContent;
   metadata?: Record<string, unknown>;
 };
 
-/** Configuration for the XMPT extension. */
 export type XMPTOptions = {
-  /**
-   * Inbox configuration. If omitted the agent can still _send_ messages
-   * but will not expose an inbox entrypoint.
-   */
   inbox?: {
-    /** Entrypoint key to register (default: 'xmpt-inbox'). */
     key?: string;
-    /** Handler invoked for every inbound message. */
     handler: (ctx: XMPTInboxContext) => Promise<XMPTInboxReply | void>;
   };
-
-  /**
-   * Custom message store. Defaults to in-memory store.
-   */
   store?: XMPTStore;
-
-  /**
-   * Discovery options for the inbox skill.
-   */
   discovery?: {
-    /** Override the skill ID used for capability discovery. */
     preferredSkillId?: string;
   };
-
-  /**
-   * Base URL of this agent (used as the `from` field in outbound messages).
-   * Inferred from PORT env variable when not provided.
-   */
   selfUrl?: string;
 };

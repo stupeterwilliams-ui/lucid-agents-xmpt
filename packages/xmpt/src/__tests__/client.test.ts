@@ -1,122 +1,110 @@
-/**
- * Unit tests: client.ts peer resolution + send functions
- * TDD Milestone 2: Send / Receive Core
- */
 import { describe, it, expect } from 'bun:test';
-import { resolvePeerUrl } from '../client.js';
-import type { XMPTPeer } from '../../types/index.js';
+import {
+  resolvePeerUrl,
+  buildMessage,
+  generateMessageId,
+  XMPTError,
+  XMPTMessageSchema,
+} from '../client.js';
 
 describe('resolvePeerUrl', () => {
-  it('resolves peer with direct url', () => {
-    const peer: XMPTPeer = { url: 'http://agent-b:8788' };
-    expect(resolvePeerUrl(peer)).toBe('http://agent-b:8788');
+  it('resolves a url peer', () => {
+    const url = resolvePeerUrl({ url: 'http://localhost:8080' });
+    expect(url).toBe('http://localhost:8080');
   });
 
-  it('resolves peer from card with url', () => {
-    const peer: XMPTPeer = { card: { url: 'http://agent-b:8788', name: 'beta' } };
-    expect(resolvePeerUrl(peer)).toBe('http://agent-b:8788');
+  it('resolves a card peer by url field', () => {
+    const url = resolvePeerUrl({ card: { url: 'http://agent.example.com', name: 'test' } });
+    expect(url).toBe('http://agent.example.com');
   });
 
-  it('throws XMPT_PEER_NO_URL when card has no url', () => {
-    const peer: XMPTPeer = { card: { name: 'no-url-agent' } };
-    expect(() => resolvePeerUrl(peer)).toThrow('XMPT_PEER_NO_URL');
+  it('resolves a card peer via supportedInterfaces', () => {
+    const url = resolvePeerUrl({
+      card: {
+        name: 'test',
+        supportedInterfaces: [{ url: 'http://iface.example.com', protocolBinding: 'http' }],
+      },
+    });
+    expect(url).toBe('http://iface.example.com');
+  });
+
+  it('throws XMPTError when card has no url', () => {
+    expect(() => resolvePeerUrl({ card: { name: 'no-url' } })).toThrow(XMPTError);
   });
 });
 
-describe('sendViaAgentm (mocked fetch)', () => {
-  it('sends POST /tasks with XMPT envelope', async () => {
-    const calls: { url: string; body: any }[] = [];
+describe('buildMessage', () => {
+  it('builds a message with defaults', () => {
+    const msg = buildMessage({ content: { text: 'hello' } });
+    expect(msg.content.text).toBe('hello');
+    expect(msg.id).toBeTruthy();
+    expect(msg.createdAt).toBeTruthy();
+  });
 
-    const mockFetch = async (url: string, init?: any) => {
-      calls.push({ url, body: JSON.parse(init?.body ?? '{}') });
-      return {
-        ok: true,
-        json: async () => ({ taskId: 'task-123', status: 'running' }),
-      } as any;
-    };
+  it('applies options.threadId', () => {
+    const msg = buildMessage({ content: { text: 'hi' } }, { threadId: 't-99' });
+    expect(msg.threadId).toBe('t-99');
+  });
 
-    const { sendViaAgentm } = await import('../client.js');
-    const message = {
-      id: 'msg-1',
+  it('does not override explicit id', () => {
+    const msg = buildMessage({ content: { text: 'hi' }, id: 'fixed-id' });
+    expect(msg.id).toBe('fixed-id');
+  });
+
+  it('sets from to selfUrl', () => {
+    const msg = buildMessage({ content: { text: 'x' } }, { selfUrl: 'http://me:1234' });
+    expect(msg.from).toBe('http://me:1234');
+  });
+
+  it('sets to to peerUrl', () => {
+    const msg = buildMessage({ content: { text: 'x' } }, { peerUrl: 'http://peer:9000' });
+    expect(msg.to).toBe('http://peer:9000');
+  });
+});
+
+describe('generateMessageId', () => {
+  it('returns a non-empty string', () => {
+    const id = generateMessageId();
+    expect(typeof id).toBe('string');
+    expect(id.length).toBeGreaterThan(0);
+  });
+
+  it('generates unique ids', () => {
+    const ids = new Set(Array.from({ length: 100 }, generateMessageId));
+    expect(ids.size).toBe(100);
+  });
+});
+
+describe('XMPTMessageSchema', () => {
+  it('validates a complete message', () => {
+    const msg = {
+      id: 'abc',
       threadId: 't-1',
-      from: 'http://agent-a:8787',
-      to: 'http://agent-b:8788',
-      content: { text: 'hello' },
+      from: 'http://a:3000',
+      to: 'http://b:4000',
+      content: { text: 'hello', mime: 'text/plain' },
+      metadata: { key: 'value' },
       createdAt: new Date().toISOString(),
     };
-
-    const result = await sendViaAgentm(
-      { url: 'http://agent-b:8788' },
-      message,
-      {},
-      mockFetch as any
-    );
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe('http://agent-b:8788/tasks');
-    expect(calls[0].body.message.role).toBe('user');
-    expect(calls[0].body.contextId).toBe('t-1');
-    expect(result.taskId).toBe('task-123');
-    expect(result.messageId).toBe('msg-1');
+    expect(() => XMPTMessageSchema.parse(msg)).not.toThrow();
   });
 
-  it('throws XMPT_SEND_FAILED on non-ok response', async () => {
-    const mockFetch = async () =>
-      ({
-        ok: false,
-        status: 503,
-        statusText: 'Service Unavailable',
-        text: async () => 'peer down',
-      } as any);
-
-    const { sendViaAgentm } = await import('../client.js');
-    const message = {
-      id: 'msg-fail',
-      threadId: 't-fail',
-      from: 'http://agent-a:8787',
-      to: 'http://agent-b:8788',
-      content: { text: 'test' },
+  it('validates a minimal message', () => {
+    const msg = {
+      id: 'min',
+      content: {},
       createdAt: new Date().toISOString(),
     };
-
-    await expect(
-      sendViaAgentm({ url: 'http://agent-b:8788' }, message, {}, mockFetch as any)
-    ).rejects.toThrow('XMPT_SEND_FAILED');
+    expect(() => XMPTMessageSchema.parse(msg)).not.toThrow();
   });
-});
 
-describe('sendViaHttp (mocked fetch)', () => {
-  it('sends POST /xmpt/inbox with envelope', async () => {
-    const calls: { url: string; body: any }[] = [];
+  it('rejects message without id', () => {
+    expect(() =>
+      XMPTMessageSchema.parse({ content: { text: 'x' }, createdAt: new Date().toISOString() })
+    ).toThrow();
+  });
 
-    const mockFetch = async (url: string, init?: any) => {
-      calls.push({ url, body: JSON.parse(init?.body ?? '{}') });
-      return {
-        ok: true,
-        json: async () => ({ taskId: 'http-task', status: 'delivered' }),
-      } as any;
-    };
-
-    const { sendViaHttp } = await import('../client.js');
-    const message = {
-      id: 'msg-http',
-      threadId: 't-http',
-      from: 'http://agent-a:8787',
-      to: 'http://agent-b:8788',
-      content: { text: 'direct' },
-      createdAt: new Date().toISOString(),
-    };
-
-    const result = await sendViaHttp(
-      { url: 'http://agent-b:8788' },
-      message,
-      'xmpt-inbox',
-      {},
-      mockFetch as any
-    );
-
-    expect(calls[0].url).toBe('http://agent-b:8788/xmpt/inbox');
-    expect(calls[0].body.id).toBe('msg-http');
-    expect(result.status).toBe('delivered');
+  it('rejects message without createdAt', () => {
+    expect(() => XMPTMessageSchema.parse({ id: 'x', content: {} })).toThrow();
   });
 });

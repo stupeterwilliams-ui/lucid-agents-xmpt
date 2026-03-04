@@ -1,52 +1,58 @@
-import type { XMPTMessage, XMPTMessageFilter, XMPTStore } from '../../types/index.js';
-
 /**
- * In-memory message store.
- * Stores all messages in a simple array. No persistence across restarts.
- * This is the default MVP store — persistence is deferred.
+ * In-memory implementation of XMPTStore.
+ * Messages are lost on process restart. For production, replace with
+ * a persistent store (SQLite, Postgres, Redis, etc.).
  */
+
+import type { XMPTMessage, XMPTStore, XMPTListFilters } from '../types.js';
+
 export class MemoryStore implements XMPTStore {
-  private messages: XMPTMessage[] = [];
+  private readonly messages = new Map<string, XMPTMessage>();
 
-  save(message: XMPTMessage): void {
-    this.messages.push(message);
+  async save(message: XMPTMessage): Promise<void> {
+    this.messages.set(message.id, message);
   }
 
-  list(filter?: XMPTMessageFilter): XMPTMessage[] {
-    let result = [...this.messages];
-
-    if (filter?.threadId) {
-      result = result.filter(m => m.threadId === filter.threadId);
-    }
-    if (filter?.from) {
-      result = result.filter(m => m.from === filter.from);
-    }
-    if (filter?.to) {
-      result = result.filter(m => m.to === filter.to);
-    }
-    if (filter?.since) {
-      const since = new Date(filter.since).getTime();
-      result = result.filter(
-        m => new Date(m.createdAt).getTime() >= since
-      );
-    }
-    if (filter?.limit !== undefined) {
-      result = result.slice(0, filter.limit);
-    }
-
-    return result;
+  async get(id: string): Promise<XMPTMessage | undefined> {
+    return this.messages.get(id);
   }
 
-  get(id: string): XMPTMessage | undefined {
-    return this.messages.find(m => m.id === id);
+  async list(filters?: XMPTListFilters): Promise<XMPTMessage[]> {
+    let results = Array.from(this.messages.values());
+
+    if (filters?.threadId) {
+      results = results.filter(m => m.threadId === filters.threadId);
+    }
+    if (filters?.from) {
+      results = results.filter(m => m.from === filters.from);
+    }
+    if (filters?.to) {
+      results = results.filter(m => m.to === filters.to);
+    }
+
+    // Sort newest first
+    results.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+
+    const offset = filters?.offset ?? 0;
+    const limit = filters?.limit ?? results.length;
+    return results.slice(offset, offset + limit);
   }
 
-  /** Clears all messages. Useful in tests. */
+  /** Returns total number of stored messages (useful in tests). */
+  size(): number {
+    return this.messages.size;
+  }
+
+  /** Clears all stored messages. */
   clear(): void {
-    this.messages = [];
+    this.messages.clear();
   }
 }
 
-export function createMemoryStore(): MemoryStore {
+/** Creates a new in-memory store instance. */
+export function createMemoryStore(): XMPTStore {
   return new MemoryStore();
 }

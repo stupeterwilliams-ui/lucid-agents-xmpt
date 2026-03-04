@@ -1,159 +1,154 @@
-import { randomUUID } from 'node:crypto';
+/**
+ * XMPT Runtime — the runtime slice exposed as `agent.xmpt`.
+ */
+
+import {
+  buildMessage,
+  deliverMessage,
+  deliverAndWait,
+  resolvePeerUrl,
+  XMPTError,
+} from './client.js';
+import { createMemoryStore } from './store/memory.js';
 import type {
-  XMPTRuntime,
   XMPTMessage,
   XMPTPeer,
   XMPTDeliveryResult,
   XMPTSendOptions,
-  XMPTContent,
-  XMPTMessageFilter,
-  XMPTMessageHandler,
-  XMPTInboxHandler,
-  XMPTInboxReply,
+  XMPTSendAndWaitOptions,
+  XMPTListFilters,
+  XMPTRuntime,
   XMPTStore,
-} from '../types/index.js';
-import {
-  resolvePeerUrl,
-  sendViaAgentm,
-  sendViaHttp,
-  pollTaskUntilComplete,
-} from './client.js';
-import type { MemoryStore } from './store/memory.js';
+  XMPTOptions,
+  XMPTInboxContext,
+  XMPTInboxReply,
+} from './types-internal.js';
 
-export type XMPTRuntimeOptions = {
-  transport: 'agentm' | 'http';
-  inboxKey: string;
-  inboxHandler?: XMPTInboxHandler;
-  store: XMPTStore;
-  agentUrl?: string; // this agent's own URL (for `from` field)
-};
+export type { XMPTRuntime };
+
+export interface XMPTRuntimeInternals extends XMPTRuntime {
+  /** Called by the inbox entrypoint handler. */
+  _handleInbound(message: XMPTMessage): Promise<XMPTInboxReply | void>;
+}
 
 /**
- * Core XMPTRuntime implementation.
- *
- * Exposes: send, sendAndWait, receive, onMessage, listMessages
+ * Creates the XMPT runtime slice.
  */
-export class XMPTRuntimeImpl implements XMPTRuntime {
-  private subscribers: XMPTMessageHandler[] = [];
-  private readonly opts: XMPTRuntimeOptions;
+export function createXMPTRuntime(options: XMPTOptions): XMPTRuntimeInternals {
+  const store: XMPTStore = options.store ?? createMemoryStore();
+  const subscribers: Array<(msg: XMPTMessage) => Promise<void> | void> = [];
+  const inboxKey = options.inbox?.key ?? 'xmpt-inbox';
+  const selfUrl = options.selfUrl ?? inferSelfUrl();
 
-  constructor(opts: XMPTRuntimeOptions) {
-    this.opts = opts;
-  }
-
-  // ── send ──────────────────────────────────────────────────────────────────
-
-  async send(
-    peer: XMTPeer,
-    partial: Omit<XMPTMessage, 'id' | 'createdAt'> & { threadId?: string },
-    options?: XMPTSendOptions
-  ): Promise<XMPTDeliveryResult> {
-    const message = this._buildMessage(peer, partial);
-
-    // Persist outbound
-    await this.opts.store.save(message);
-
-    if (this.opts.transport === 'http') {
-      return sendViaHttp(peer, message, this.opts.inboxKey, options);
-    }
-    return sendViaAgentm(peer, message, {
-      ...options,
-      metadata: {
-        ...options?.metadata,
-        inboxKey: this.opts.inboxKey,
-      },
-    });
-  }
-
-  // ── sendAndWait ───────────────────────────────────────────────────────────
-
-  async sendAndWait(
-    peer: XMTPeer,
-    partial: Omit<XMPTMessage, 'id' | 'createdAt'> & { threadId?: string },
-    options?: XMPTSendOptions
-  ): Promise<{ deliveryResult: XMPTDeliveryResult; reply?: XMPTContent }> {
-    const delivery = await this.send(peer, partial, options);
-
-    if (this.opts.transport !== 'agentm') {
-      // HTTP transport: no polling support, just return delivery
-      return { deliveryResult: delivery };
-    }
-
-    const peerUrl = resolvePeerUrl(peer);
-    const { output: reply } = await pollTaskUntilComplete(
-      peerUrl,
-      delivery.taskId,
-      options?.timeoutMs ?? 30_000
-    );
-
-    return { deliveryResult: delivery, reply };
-  }
-
-  // ── receive ───────────────────────────────────────────────────────────────
-
-  async receive(message: XMPTMessage): Promise<XMPTInboxReply> {
-    // Persist inbound
-    await this.opts.store.save(message);
-
-    let reply: XMPTInboxReply = null;
-
-    if (this.opts.inboxHandler) {
-      reply = await this.opts.inboxHandler({ message });
-    }
-
-    // Notify subscribers
-    for (const sub of this.subscribers) {
+  /** Dispatch to all subscribers. */
+  async function notifySubscribers(message: XMPTMessage): Promise<void> {
+    for (const handler of subscribers) {
       try {
-        await sub(message);
-      } catch {
-        // subscriber errors must not break the receive path
+        await handler(message);
+      } catch (err) {
+        // Subscribers must not crash the runtime
+        console.error('[xmpt] subscriber error:', err);
       }
     }
-
-    return reply;
   }
 
-  // ── onMessage ─────────────────────────────────────────────────────────────
+  return {
+    async send(
+      peer: XMPTPeer,
+      partial: Pick<XMPTMessage, 'content'> & Partial<XMPTMessage>,
+      opts?: XMPTSendOptions
+    ): Promise<XMPTDeliveryResult> {
+      const peerUrl = resolvePeerUrl(peer);
+      const message = buildMessage(partial, {
+        ...opts,
+        selfUrl,
+        peerUrl,
+      });
 
-  onMessage(handler: XMPTMessageHandler): () => void {
-    this.subscribers.push(handler);
-    return () => {
-      const idx = this.subscribers.indexOf(handler);
-      if (idx !== -1) this.subscribers.splice(idx, 1);
-    };
-  }
+      await store.save(message);
+      const result = await deliverMessage(peerUrl, message, opts);
+      return result;
+    },
 
-  // ── listMessages ─────────────────────────────────────────────────────────
+    async sendAndWait(
+      peer: XMPTPeer,
+      partial: Pick<XMPTMessage, 'content'> & Partial<XMPTMessage>,
+      opts?: XMPTSendAndWaitOptions
+    ): Promise<XMPTMessage | null> {
+      const peerUrl = resolvePeerUrl(peer);
+      const message = buildMessage(partial, {
+        ...opts,
+        selfUrl,
+        peerUrl,
+      });
 
-  listMessages(filter?: XMPTMessageFilter): XMPTMessage[] {
-    const result = this.opts.store.list(filter);
-    // Support both sync and async stores — in MVP the store is always sync
-    if (Array.isArray(result)) return result;
-    // If it's a Promise, return empty (caller should await store directly)
-    return [];
-  }
+      await store.save(message);
+      const reply = await deliverAndWait(peerUrl, message, opts);
+      if (reply) {
+        await store.save(reply);
+      }
+      return reply;
+    },
 
-  // ── private ───────────────────────────────────────────────────────────────
+    async receive(message: XMPTMessage): Promise<XMPTMessage | void> {
+      await store.save(message);
+      await notifySubscribers(message);
 
-  private _buildMessage(
-    peer: XMTPeer,
-    partial: Omit<XMPTMessage, 'id' | 'createdAt'> & { threadId?: string }
-  ): XMPTMessage {
-    return {
-      id: randomUUID(),
-      threadId: partial.threadId ?? randomUUID(),
-      from: this.opts.agentUrl,
-      to: resolvePeerUrl(peer),
-      content: partial.content ?? {},
-      metadata: partial.metadata,
-      createdAt: new Date().toISOString(),
-    };
-  }
+      if (options.inbox?.handler) {
+        const ctx: XMPTInboxContext = { message, skillKey: inboxKey };
+        const reply = await options.inbox.handler(ctx);
+        if (reply) {
+          const replyMsg: XMPTMessage = {
+            id: generateReplyId(message.id),
+            threadId: message.threadId,
+            from: selfUrl,
+            to: message.from,
+            content: reply.content,
+            metadata: reply.metadata,
+            createdAt: new Date().toISOString(),
+          };
+          await store.save(replyMsg);
+          return replyMsg;
+        }
+      }
+    },
+
+    onMessage(
+      handler: (message: XMPTMessage) => Promise<void> | void
+    ): () => void {
+      subscribers.push(handler);
+      return () => {
+        const idx = subscribers.indexOf(handler);
+        if (idx !== -1) subscribers.splice(idx, 1);
+      };
+    },
+
+    async listMessages(filters?: XMPTListFilters): Promise<XMPTMessage[]> {
+      return store.list(filters);
+    },
+
+    // ── Internal ──────────────────────────────────────────────────────────
+
+    async _handleInbound(message: XMPTMessage): Promise<XMPTInboxReply | void> {
+      await store.save(message);
+      await notifySubscribers(message);
+
+      if (options.inbox?.handler) {
+        const ctx: XMPTInboxContext = { message, skillKey: inboxKey };
+        return options.inbox.handler(ctx);
+      }
+    },
+  };
 }
 
-export function createXMPTRuntime(opts: XMPTRuntimeOptions): XMPTRuntimeImpl {
-  return new XMPTRuntimeImpl(opts);
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function generateReplyId(inResponseTo: string): string {
+  return `reply-${inResponseTo}-${Date.now()}`;
 }
 
-// Re-export type alias so store/memory can import it
-export type { XMTPeer };
+function inferSelfUrl(): string | undefined {
+  const port = process.env.PORT;
+  if (port) return `http://localhost:${port}`;
+  return undefined;
+}

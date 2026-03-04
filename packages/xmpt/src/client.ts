@@ -1,194 +1,224 @@
+/**
+ * XMPT Client — handles outbound message delivery via A2A task primitives.
+ *
+ * Transport: agentm (agent messaging) — delivers messages to a peer's
+ * xmpt-inbox skill using the A2A sendMessage/waitForTask flow.
+ */
+
+import { z } from 'zod';
 import type {
   XMPTMessage,
   XMPTPeer,
   XMPTDeliveryResult,
   XMPTSendOptions,
-  XMPTContent,
-} from '../types/index.js';
+  XMPTSendAndWaitOptions,
+} from './types-internal.js';
 
-/**
- * Resolves the base URL from a peer reference.
- */
+const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_SKILL_ID = 'xmpt-inbox';
+const POLL_INTERVAL_MS = 150;
+
+/** Resolve a XMPTPeer to a base URL string. */
 export function resolvePeerUrl(peer: XMPTPeer): string {
   if ('url' in peer) {
     return peer.url;
   }
-  if ('card' in peer && peer.card.url) {
-    return peer.card.url;
+  if ('card' in peer) {
+    const card = peer.card as Record<string, unknown>;
+    const url =
+      card.url ??
+      (Array.isArray(card.supportedInterfaces) &&
+        card.supportedInterfaces[0]?.url);
+    if (typeof url !== 'string') {
+      throw new XMPTError(
+        'PEER_NO_URL',
+        'Agent card does not contain a url field'
+      );
+    }
+    return url;
   }
-  throw new Error(
-    'XMPT_PEER_NO_URL: Cannot resolve URL from peer — provide { url } or { card: { url } }'
-  );
+  throw new XMPTError('PEER_INVALID', 'Invalid peer: must have url or card');
+}
+
+// ─── Zod schema for validating inbound messages at the inbox entrypoint ──────
+
+export const XMPTMessageSchema = z.object({
+  id: z.string(),
+  threadId: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  content: z.object({
+    text: z.string().optional(),
+    data: z.unknown().optional(),
+    mime: z.string().optional(),
+  }),
+  metadata: z.record(z.unknown()).optional(),
+  createdAt: z.string(),
+});
+
+export type XMPTMessageInput = z.input<typeof XMPTMessageSchema>;
+
+// ─── Error class ─────────────────────────────────────────────────────────────
+
+export class XMPTError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly details?: unknown
+  ) {
+    super(message);
+    this.name = 'XMPTError';
+  }
+}
+
+// ─── Message builder ─────────────────────────────────────────────────────────
+
+let _counter = 0;
+
+/** Generate a simple unique message ID (UUID v4-ish). */
+export function generateMessageId(): string {
+  const hex = () => Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0');
+  return `${hex()}${hex()}-${hex()}-4${hex().slice(1)}-${hex()}-${hex()}${hex()}${hex()}`;
 }
 
 /**
- * Sends an XMPT message to a remote peer using the agentm (A2A task) transport.
+ * Build a complete XMPTMessage from a partial input.
+ */
+export function buildMessage(
+  partial: Pick<XMPTMessage, 'content'> & Partial<XMPTMessage>,
+  options?: XMPTSendOptions & { selfUrl?: string; peerUrl?: string }
+): XMPTMessage {
+  return {
+    id: partial.id ?? generateMessageId(),
+    threadId: partial.threadId ?? options?.threadId,
+    from: partial.from ?? options?.selfUrl,
+    to: partial.to ?? options?.peerUrl,
+    content: partial.content,
+    metadata: partial.metadata ?? options?.metadata,
+    createdAt: partial.createdAt ?? new Date().toISOString(),
+  };
+}
+
+// ─── Delivery ─────────────────────────────────────────────────────────────────
+
+/**
+ * Deliver a message to a remote peer's inbox skill via HTTP POST.
  *
- * Builds a POST /tasks request in A2A format with the XMPT envelope embedded
- * in the message content. Returns a delivery result immediately.
+ * We POST directly to /entrypoints/{skillId}/invoke — this aligns with
+ * Lucid's task-based A2A model while giving XMPT semantic clarity.
  */
-export async function sendViaAgentm(
-  peer: XMPTPeer,
+export async function deliverMessage(
+  peerUrl: string,
   message: XMPTMessage,
-  options?: XMPTSendOptions,
-  fetchImpl?: typeof fetch
+  options?: XMPTSendOptions
 ): Promise<XMPTDeliveryResult> {
-  const baseUrl = resolvePeerUrl(peer);
-  const fetchFn = fetchImpl ?? globalThis.fetch;
+  const skillId = options?.skillId ?? DEFAULT_SKILL_ID;
+  const url = `${peerUrl.replace(/\/$/, '')}/entrypoints/${skillId}/invoke`;
 
-  const inboxKey = options?.metadata?.inboxKey ?? 'xmpt-inbox';
-
-  const body = {
-    message: {
-      role: 'user',
-      content: {
-        text: JSON.stringify(message),
-        mime: 'application/json+xmpt',
-      },
-    },
-    skillId: inboxKey,
-    contextId: message.threadId,
-    metadata: {
-      xmpt: true,
-      messageId: message.id,
-      ...options?.metadata,
-    },
-  };
-
-  const response = await fetchFn(`${baseUrl}/tasks`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: options?.timeoutMs
-      ? AbortSignal.timeout(options.timeoutMs)
-      : undefined,
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(
-      `XMPT_SEND_FAILED: ${response.status} ${response.statusText}${text ? ': ' + text : ''}`
-    );
-  }
-
-  const result = (await response.json()) as {
-    taskId?: string;
-    status?: string;
-  };
-
-  return {
-    taskId: result.taskId ?? 'unknown',
-    status: result.status ?? 'submitted',
-    messageId: message.id,
-  };
-}
-
-/**
- * Sends an XMPT message via direct HTTP POST to the peer's inbox endpoint.
- * Simpler than agentm — posts the XMPT envelope directly.
- */
-export async function sendViaHttp(
-  peer: XMPTPeer,
-  message: XMPTMessage,
-  inboxKey: string,
-  options?: XMPTSendOptions,
-  fetchImpl?: typeof fetch
-): Promise<XMPTDeliveryResult> {
-  const baseUrl = resolvePeerUrl(peer);
-  const fetchFn = fetchImpl ?? globalThis.fetch;
-
-  const response = await fetchFn(`${baseUrl}/xmpt/inbox`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-XMPT-Inbox-Key': inboxKey,
-    },
-    body: JSON.stringify(message),
-    signal: options?.timeoutMs
-      ? AbortSignal.timeout(options.timeoutMs)
-      : undefined,
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(
-      `XMPT_SEND_FAILED: ${response.status} ${response.statusText}${text ? ': ' + text : ''}`
-    );
-  }
-
-  const result = (await response.json()) as {
-    taskId?: string;
-    messageId?: string;
-    status?: string;
-  };
-
-  return {
-    taskId: result.taskId ?? `http-${message.id}`,
-    status: result.status ?? 'delivered',
-    messageId: message.id,
-  };
-}
-
-/**
- * Polls a task until it completes or times out.
- * Used by sendAndWait when transport = agentm.
- */
-export async function pollTaskUntilComplete(
-  baseUrl: string,
-  taskId: string,
-  timeoutMs = 30_000,
-  fetchImpl?: typeof fetch
-): Promise<{ status: string; output?: XMPTContent }> {
-  const fetchFn = fetchImpl ?? globalThis.fetch;
-  const deadline = Date.now() + timeoutMs;
-  const pollIntervalMs = 200;
-
-  while (Date.now() < deadline) {
-    const response = await fetchFn(`${baseUrl}/tasks/${taskId}`, {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: message }),
     });
-
-    if (!response.ok) {
-      throw new Error(
-        `XMPT_POLL_FAILED: task/${taskId} returned ${response.status}`
-      );
-    }
-
-    const task = (await response.json()) as {
-      status: string;
-      result?: { output?: unknown };
-      error?: { message?: string };
-    };
-
-    if (task.status === 'completed') {
-      // Try to extract reply from output
-      const output = task.result?.output;
-      let reply: XMPTContent | undefined;
-      if (output && typeof output === 'object') {
-        const o = output as Record<string, unknown>;
-        if (o.content && typeof o.content === 'object') {
-          reply = o.content as XMPTContent;
-        } else if (o.text !== undefined || o.data !== undefined) {
-          reply = o as XMPTContent;
-        }
-      }
-      return { status: 'completed', output: reply };
-    }
-
-    if (task.status === 'failed') {
-      throw new Error(
-        `XMPT_TASK_FAILED: ${task.error?.message ?? 'task failed'}`
-      );
-    }
-
-    if (task.status === 'cancelled') {
-      throw new Error('XMPT_TASK_CANCELLED: task was cancelled');
-    }
-
-    await new Promise(res => setTimeout(res, pollIntervalMs));
+  } catch (err) {
+    throw new XMPTError(
+      'PEER_NOT_REACHABLE',
+      `Cannot reach peer at ${peerUrl}: ${err instanceof Error ? err.message : String(err)}`,
+      err
+    );
   }
 
-  throw new Error(
-    `XMPT_TIMEOUT: sendAndWait timed out after ${timeoutMs}ms for task ${taskId}`
-  );
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new XMPTError(
+      'DELIVERY_FAILED',
+      `Peer returned ${response.status}: ${body}`,
+      { status: response.status, body }
+    );
+  }
+
+  const result = await response.json().catch(() => ({})) as Record<string, unknown>;
+
+  return {
+    taskId: (result.run_id as string) ?? (result.taskId as string) ?? message.id,
+    status: (result.status as string) ?? 'completed',
+    messageId: message.id,
+  };
+}
+
+/**
+ * Deliver a message and wait for the remote agent to echo back a reply.
+ *
+ * The remote agent's inbox handler can return a reply. We retrieve it
+ * from the invoke response output.
+ */
+export async function deliverAndWait(
+  peerUrl: string,
+  message: XMPTMessage,
+  options?: XMPTSendAndWaitOptions
+): Promise<XMPTMessage | null> {
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const skillId = options?.skillId ?? DEFAULT_SKILL_ID;
+  const url = `${peerUrl.replace(/\/$/, '')}/entrypoints/${skillId}/invoke`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: message }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if ((err as Error)?.name === 'AbortError') {
+      throw new XMPTError(
+        'TIMEOUT',
+        `sendAndWait timed out after ${timeoutMs}ms`
+      );
+    }
+    throw new XMPTError(
+      'PEER_NOT_REACHABLE',
+      `Cannot reach peer at ${peerUrl}: ${err instanceof Error ? err.message : String(err)}`,
+      err
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new XMPTError(
+      'DELIVERY_FAILED',
+      `Peer returned ${response.status}: ${body}`,
+      { status: response.status, body }
+    );
+  }
+
+  const result = await response.json().catch(() => ({})) as Record<string, unknown>;
+
+  // The invoke response may embed the reply in output.reply or output directly
+  const output = result.output as Record<string, unknown> | undefined;
+  if (!output) return null;
+
+  // If the inbox handler returned a reply, it is wrapped in output.reply
+  const replyContent = output.reply ?? output;
+  if (!replyContent || typeof replyContent !== 'object') return null;
+
+  const replyObj = replyContent as Record<string, unknown>;
+
+  return {
+    id: (replyObj.id as string) ?? generateMessageId(),
+    threadId: message.threadId,
+    from: peerUrl,
+    to: message.from,
+    content: (replyObj.content as XMPTMessage['content']) ?? { text: String(replyContent) },
+    metadata: replyObj.metadata as Record<string, unknown> | undefined,
+    createdAt: (replyObj.createdAt as string) ?? new Date().toISOString(),
+  };
 }

@@ -1,140 +1,176 @@
-import type { XMPTOptions, XMPTRuntime } from '../types/index.js';
-import { createMemoryStore } from './store/memory.js';
-import { createXMPTRuntime } from './runtime.js';
-
 /**
- * XMPT extension for the Lucid SDK agent builder.
+ * XMPT Extension — wires xmpt() into the Lucid Agent builder.
  *
  * Usage:
- * ```ts
- * createAgent(config)
- *   .use(http())
- *   .use(a2a())
- *   .use(xmpt({
- *     transport: 'agentm',
- *     inbox: {
- *       key: 'xmpt-inbox',
- *       handler: async ({ message }) => ({
- *         content: { text: `ack:${message.content.text ?? ''}` },
- *       }),
- *     },
- *   }))
- *   .build()
- * ```
+ *   createAgent(config)
+ *     .use(http())
+ *     .use(a2a())
+ *     .use(xmpt({ inbox: { handler: async ({ message }) => ... } }))
+ *     .build()
+ *
+ * Also supports transport option for capability discovery:
+ *   xmpt({ transport: 'agentm', inbox: { ... } })
  */
-export function xmpt(opts: XMPTOptions = {}): {
+
+import { createXMPTRuntime } from './runtime.js';
+import type { XMPTRuntime } from './types-internal.js';
+import type { XMPTRuntimeInternals } from './runtime.js';
+
+const DEFAULT_INBOX_KEY = 'xmpt-inbox';
+
+/** Options for the xmpt() extension (superset of XMPTOptions). */
+export type XMPTExtensionOptions = {
+  /** Inbox configuration. */
+  inbox?: {
+    key?: string;
+    handler: (ctx: { message: any; skillKey: string }) => Promise<{ content: any; metadata?: any } | void | null>;
+  };
+  /** Custom message store. */
+  store?: any;
+  /** Discovery options. */
+  discovery?: { preferredSkillId?: string };
+  /** Base URL of this agent. */
+  selfUrl?: string;
+  /**
+   * Transport mode declaration for capability metadata.
+   * Default: 'agentm'
+   */
+  transport?: string;
+};
+
+/**
+ * Creates the XMPT extension.
+ */
+export function xmpt(options: XMPTExtensionOptions = {}): {
   name: string;
-  build: (ctx: any) => { xmpt: XMPTRuntime };
-  onBuild: (runtime: any) => void | Promise<void>;
-  onManifestBuild: (card: any, runtime: any) => any;
+  build(ctx: Record<string, unknown>): { xmpt: XMPTRuntime };
+  onBuild(runtime: Record<string, unknown>): void | Promise<void>;
+  onManifestBuild(card: Record<string, unknown>, runtime: Record<string, unknown>): Record<string, unknown>;
 } {
-  const {
-    transport = 'agentm',
-    inbox,
-    store = createMemoryStore(),
-    discovery,
-  } = opts;
+  const inboxKey = options.inbox?.key ?? DEFAULT_INBOX_KEY;
+  const transport = options.transport ?? 'agentm';
+  const discoverySkillId = options.discovery?.preferredSkillId ?? inboxKey;
 
-  const inboxKey = inbox?.key ?? 'xmpt-inbox';
+  // Lazily-created runtime — ensures it exists whether build() or onBuild() is called first
+  let _runtime: XMPTRuntimeInternals | undefined;
 
-  // We create the runtime lazily in onBuild so it can access the agent's own URL.
-  let xmptRuntime: XMPTRuntime | null = null;
+  function ensureRuntime(): XMPTRuntimeInternals {
+    if (!_runtime) {
+      _runtime = createXMPTRuntime(options as any);
+    }
+    return _runtime;
+  }
 
   return {
     name: 'xmpt',
 
-    build(_ctx: any): { xmpt: XMPTRuntime } {
-      // Return placeholder — will be replaced in onBuild
-      return { xmpt: {} as XMPTRuntime };
+    build(_ctx) {
+      return { xmpt: ensureRuntime() };
     },
 
-    onBuild(runtime: any): void | Promise<void> {
-      // Determine this agent's own URL (best-effort)
-      const agentUrl: string | undefined =
-        runtime?.agent?.config?.meta?.url ??
-        (typeof process !== 'undefined' && process.env.AGENT_URL
-          ? process.env.AGENT_URL
-          : undefined);
+    async onBuild(runtime) {
+      const rt = ensureRuntime();
 
-      xmptRuntime = createXMPTRuntime({
-        transport,
-        inboxKey,
-        inboxHandler: inbox?.handler,
-        store,
-        agentUrl,
-      });
+      // Inject xmpt runtime onto the agent runtime object
+      (runtime as any).xmpt = rt;
 
-      // Inject into the runtime object
-      runtime.xmpt = xmptRuntime;
+      // Register the inbox entrypoint if a handler is configured
+      if (!options.inbox) return;
 
-      // Register the inbox entrypoint so remote agents can deliver messages
-      if (inbox?.handler) {
-        try {
-          runtime.entrypoints.add({
-            key: inboxKey,
-            description: 'XMPT message inbox — accepts agent-to-agent messages',
-            tags: ['xmpt', 'inbox', 'messaging'],
-            input: {
-              type: 'object',
-              properties: {
-                id: { type: 'string' },
-                threadId: { type: 'string' },
-                from: { type: 'string' },
-                to: { type: 'string' },
-                content: { type: 'object' },
-                metadata: { type: 'object' },
-                createdAt: { type: 'string' },
-              },
-              required: ['id', 'threadId', 'content', 'createdAt'],
-            },
-            async handler({ input }: { input: any }) {
-              const reply = await xmptRuntime!.receive(input);
-              return {
-                output: reply ?? { status: 'received', messageId: input.id },
-              };
-            },
-          });
-        } catch (e) {
-          // entrypoint key may already exist if user registered it manually — ignore
-          const msg = e instanceof Error ? e.message : String(e);
-          if (!msg.includes('already')) {
-            throw e;
-          }
-        }
+      const entrypoints = (runtime as any).entrypoints;
+      if (!entrypoints?.add) {
+        console.warn('[xmpt] runtime.entrypoints.add not available — inbox skill not registered');
+        return;
       }
+
+      entrypoints.add({
+        key: inboxKey,
+        description: `XMPT inbox — accepts agent-to-agent messages. Tags: xmpt, inbox`,
+        tags: ['xmpt', 'inbox', 'messaging'],
+
+        async handler({ input }: { input: Record<string, unknown> }) {
+          const message = input as any;
+          const reply = await rt._handleInbound(message);
+
+          return {
+            output: reply
+              ? {
+                  content: (reply as any).content,
+                  metadata: (reply as any).metadata,
+                  createdAt: new Date().toISOString(),
+                }
+              : null,
+          };
+        },
+      });
     },
 
-    onManifestBuild(card: any, _runtime: any): any {
-      // Tag the skill for discoverability
-      if (!card.skills) card.skills = [];
+    onManifestBuild(card, _runtime) {
+      const skills = Array.isArray((card as any).skills)
+        ? [...((card as any).skills as Record<string, unknown>[])]
+        : [];
 
-      const alreadyTagged = card.skills.some(
-        (s: any) => s.id === inboxKey
-      );
+      const capabilities = {
+        ...((card as any).capabilities as Record<string, unknown> ?? {}),
+      };
 
-      if (!alreadyTagged && inbox?.handler) {
-        card.skills.push({
+      // ── Skills ──────────────────────────────────────────────────────────────
+      if (options.inbox) {
+        const existingIdx = skills.findIndex(
+          (s) => s.id === inboxKey || s.id === discoverySkillId
+        );
+
+        const baseTags = existingIdx >= 0
+          ? ((skills[existingIdx].tags as string[]) ?? [])
+          : [];
+
+        const mergedTags = Array.from(
+          new Set([...baseTags, 'xmpt', 'inbox', 'messaging', 'a2a'])
+        );
+
+        const xmptSkill = {
+          ...(existingIdx >= 0 ? skills[existingIdx] : {}),
           id: inboxKey,
           name: 'XMPT Inbox',
-          description: 'Accepts agent-to-agent messages via the XMPT protocol',
-          tags: ['xmpt', 'inbox', 'messaging', 'a2a'],
-          inputModes: ['application/json', 'application/json+xmpt'],
+          description: 'Accepts agent-to-agent messages via XMPT protocol',
+          tags: mergedTags,
+          inputModes: ['application/json'],
           outputModes: ['application/json'],
-        });
+        };
+
+        if (existingIdx >= 0) {
+          skills[existingIdx] = xmptSkill;
+        } else {
+          skills.push(xmptSkill);
+        }
       }
 
-      // Mark XMPT capability in the card
-      if (!card.capabilities) card.capabilities = {};
-      if (!card.capabilities.extensions) card.capabilities.extensions = [];
-      card.capabilities.extensions.push({
+      // ── Capabilities.extensions ─────────────────────────────────────────────
+      const extensions = Array.isArray(capabilities.extensions)
+        ? [...(capabilities.extensions as Record<string, unknown>[])]
+        : [];
+
+      const existingCapIdx = extensions.findIndex((e) => (e as any).id === 'xmpt');
+      const xmptCap = {
         id: 'xmpt',
-        version: '0.1.0',
         transport,
         inboxSkillId: inboxKey,
-        preferredSkillId: discovery?.preferredSkillId ?? inboxKey,
-      });
+        preferredSkillId: discoverySkillId,
+      };
 
-      return card;
+      if (existingCapIdx >= 0) {
+        extensions[existingCapIdx] = xmptCap;
+      } else {
+        extensions.push(xmptCap);
+      }
+
+      capabilities.extensions = extensions;
+
+      return {
+        ...card,
+        skills,
+        capabilities,
+      };
     },
   };
 }

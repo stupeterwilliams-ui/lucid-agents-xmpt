@@ -1,17 +1,10 @@
-/**
- * Unit tests: MemoryStore
- * TDD Milestone 3: Threading + Store
- */
 import { describe, it, expect, beforeEach } from 'bun:test';
-import { createMemoryStore } from '../store/memory.js';
-import type { XMPTMessage } from '../../types/index.js';
+import { MemoryStore } from '../store/memory.js';
+import type { XMPTMessage } from '../types-internal.js';
 
-function makeMessage(overrides: Partial<XMPTMessage> = {}): XMPTMessage {
+function makeMsg(overrides: Partial<XMPTMessage> = {}): XMPTMessage {
   return {
-    id: `msg-${Math.random().toString(36).slice(2)}`,
-    threadId: 'thread-1',
-    from: 'http://agent-a:8787',
-    to: 'http://agent-b:8788',
+    id: `msg-${Date.now()}-${Math.random()}`,
     content: { text: 'hello' },
     createdAt: new Date().toISOString(),
     ...overrides,
@@ -19,91 +12,81 @@ function makeMessage(overrides: Partial<XMPTMessage> = {}): XMPTMessage {
 }
 
 describe('MemoryStore', () => {
-  let store: ReturnType<typeof createMemoryStore>;
+  let store: MemoryStore;
 
   beforeEach(() => {
-    store = createMemoryStore();
+    store = new MemoryStore();
   });
 
-  it('should start empty', () => {
-    expect(store.list()).toHaveLength(0);
+  it('saves and retrieves a message by id', async () => {
+    const msg = makeMsg({ id: 'test-1' });
+    await store.save(msg);
+    const retrieved = await store.get('test-1');
+    expect(retrieved).toEqual(msg);
   });
 
-  it('should save and retrieve a message', () => {
-    const msg = makeMessage();
-    store.save(msg);
-    expect(store.list()).toHaveLength(1);
-    expect(store.list()[0]).toEqual(msg);
+  it('returns undefined for unknown id', async () => {
+    const retrieved = await store.get('does-not-exist');
+    expect(retrieved).toBeUndefined();
   });
 
-  it('should get a message by id', () => {
-    const msg = makeMessage({ id: 'specific-id' });
-    store.save(msg);
-    expect(store.get('specific-id')).toEqual(msg);
+  it('lists all messages', async () => {
+    const m1 = makeMsg({ id: 'm1', createdAt: new Date(1000).toISOString() });
+    const m2 = makeMsg({ id: 'm2', createdAt: new Date(2000).toISOString() });
+    await store.save(m1);
+    await store.save(m2);
+    const list = await store.list();
+    expect(list).toHaveLength(2);
   });
 
-  it('should return undefined for unknown id', () => {
-    expect(store.get('nonexistent')).toBeUndefined();
+  it('filters by threadId', async () => {
+    await store.save(makeMsg({ id: 'a', threadId: 'thread-1' }));
+    await store.save(makeMsg({ id: 'b', threadId: 'thread-2' }));
+    await store.save(makeMsg({ id: 'c', threadId: 'thread-1' }));
+
+    const result = await store.list({ threadId: 'thread-1' });
+    expect(result).toHaveLength(2);
+    expect(result.every(m => m.threadId === 'thread-1')).toBe(true);
   });
 
-  it('should filter by threadId', () => {
-    store.save(makeMessage({ threadId: 'thread-1' }));
-    store.save(makeMessage({ threadId: 'thread-2' }));
-    store.save(makeMessage({ threadId: 'thread-1' }));
-
-    const thread1 = store.list({ threadId: 'thread-1' });
-    expect(thread1).toHaveLength(2);
-    thread1.forEach(m => expect(m.threadId).toBe('thread-1'));
+  it('filters by from', async () => {
+    await store.save(makeMsg({ id: 'x', from: 'http://agent-a:3000' }));
+    await store.save(makeMsg({ id: 'y', from: 'http://agent-b:3001' }));
+    const result = await store.list({ from: 'http://agent-a:3000' });
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('x');
   });
 
-  it('should filter by from', () => {
-    store.save(makeMessage({ from: 'http://agent-a:8787' }));
-    store.save(makeMessage({ from: 'http://agent-b:8788' }));
-    const fromA = store.list({ from: 'http://agent-a:8787' });
-    expect(fromA).toHaveLength(1);
+  it('respects limit and offset', async () => {
+    for (let i = 0; i < 10; i++) {
+      await store.save(makeMsg({ id: `m${i}`, createdAt: new Date(i * 1000).toISOString() }));
+    }
+    const page1 = await store.list({ limit: 3, offset: 0 });
+    const page2 = await store.list({ limit: 3, offset: 3 });
+    expect(page1).toHaveLength(3);
+    expect(page2).toHaveLength(3);
+    // No overlap
+    const ids1 = new Set(page1.map(m => m.id));
+    expect(page2.every(m => !ids1.has(m.id))).toBe(true);
   });
 
-  it('should filter by to', () => {
-    store.save(makeMessage({ to: 'http://agent-b:8788' }));
-    store.save(makeMessage({ to: 'http://agent-c:8789' }));
-    const toB = store.list({ to: 'http://agent-b:8788' });
-    expect(toB).toHaveLength(1);
+  it('returns messages sorted newest-first', async () => {
+    await store.save(makeMsg({ id: 'old', createdAt: new Date(1000).toISOString() }));
+    await store.save(makeMsg({ id: 'new', createdAt: new Date(9000).toISOString() }));
+    const [first] = await store.list();
+    expect(first.id).toBe('new');
   });
 
-  it('should filter by since timestamp', () => {
-    const early = makeMessage({
-      createdAt: new Date('2024-01-01T00:00:00Z').toISOString(),
-    });
-    const late = makeMessage({
-      createdAt: new Date('2025-01-01T00:00:00Z').toISOString(),
-    });
-    store.save(early);
-    store.save(late);
-    const recent = store.list({ since: '2024-06-01T00:00:00Z' });
-    expect(recent).toHaveLength(1);
-    expect(recent[0].createdAt).toBe(late.createdAt);
+  it('size() reflects saved count', async () => {
+    expect(store.size()).toBe(0);
+    await store.save(makeMsg());
+    await store.save(makeMsg());
+    expect(store.size()).toBe(2);
   });
 
-  it('should respect limit filter', () => {
-    for (let i = 0; i < 10; i++) store.save(makeMessage());
-    expect(store.list({ limit: 3 })).toHaveLength(3);
-  });
-
-  it('should preserve threadId across multiple saves', () => {
-    const t = 'thread-xyz';
-    store.save(makeMessage({ threadId: t, content: { text: 'msg1' } }));
-    store.save(makeMessage({ threadId: t, content: { text: 'msg2' } }));
-    store.save(makeMessage({ threadId: t, content: { text: 'msg3' } }));
-
-    const thread = store.list({ threadId: t });
-    expect(thread).toHaveLength(3);
-    expect(thread.map(m => m.content.text)).toEqual(['msg1', 'msg2', 'msg3']);
-  });
-
-  it('should clear all messages', () => {
-    store.save(makeMessage());
-    store.save(makeMessage());
+  it('clear() removes all messages', async () => {
+    await store.save(makeMsg());
     store.clear();
-    expect(store.list()).toHaveLength(0);
+    expect(store.size()).toBe(0);
   });
 });
