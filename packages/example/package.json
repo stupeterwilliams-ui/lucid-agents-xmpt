@@ -1,0 +1,13 @@
+{
+  "name": "@lucid-agents/xmpt-example",
+  "version": "0.1.0",
+  "description": "Local two-agent E2E example for @lucid-agents/xmpt",
+  "type": "module",
+  "scripts": {
+    "example": "bun run src/local-messaging.ts",
+    "test": "bun test src/__tests__/"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.0"
+  }
+}
